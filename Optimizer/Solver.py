@@ -6,6 +6,14 @@
 需要整体初始化的有K个cluster，每个cluster里有对应的X，Y，alpha
 还需要一个额外的记录alpha位置的变量，在更新alpha时需要用到
 
+2022-09-08
+mark：
+有两个地方需要计算alpha的信息，一个是计算协方差矩阵时，每个cluster有一个矩阵；
+第二个地方是更新alpha时，需要获得所有共用alpha的位置
+
+针对这个情况，初始化模型的时候需要传入alpha的位置和值字典，形式是：
+alpha_i: {'index': [index_1, index_2, ... , index_K], 'value': value}
+
 2022-09-03
 - init
 """
@@ -64,7 +72,7 @@ class LossMaker:
         return Loss(d_top, v_inv)
 
 
-class Loss(torch.nn.Module):
+class Loss(torch.nn.Module):  # 求解估计方程的损失函数
     def __init__(self, d_top, v_inv):
         super().__init__()
         self.d_top = d_top
@@ -72,6 +80,7 @@ class Loss(torch.nn.Module):
 
     def forward(self, y: list, mu: list):
         k = 0
+        # output的维度是input_dim * 1
         output = torch.matmul(torch.matmul(self.d_top[k], self.v_inv[k]), y[k] - mu[k])
         for k in range(1, len(y)):
             output += torch.matmul(torch.matmul(self.d_top[k], self.v_inv[k]), y[k] - mu[k])
@@ -95,7 +104,7 @@ class Solver:
         """
         :param model: 模型
         :param clusters: 族
-        :param alphas: 记录alpha结构的字典，结构是i: [index]，形状和clusters一致，
+        :param alphas: alpha的位置和值的字典
         :param loss_maker: 损失函数构造类
         """
         self.model = model
@@ -132,15 +141,38 @@ class Solver:
         # 更新phi
         phi = 0
         N = 0
+
+        res = []  # 保存预测均值
+        var = []  # 保存方差
+
         for k in range(len(self.clusters)):
             mu = self.model(self.clusters[k]['x'])
             v = self.loss_maker.variance_func(mu)
-            phi += torch.sum((self.clusters[k]['y'] - mu) / v).item()
+            r = self.clusters[k]['y'] - mu
+            res.append(r)
+            var.append(v)
+            phi += torch.sum(r ** 2 / v).item()
             N += len(mu)
         phi /= (N - self.model.input_dim)
         self.phi = phi
 
         # 更新alpha
-        for i in range(len(self.alphas)):
-            pass
+        for k, v in self.alphas.items():
+            index = v['index']
+            count = 0
+            alpha = 0
+            for kk in range(len(res)):
+                r = res[kk][index[kk]] / torch.sqrt(self.phi * var[kk][index[kk]])  # 标准化残差，形状是n_k * 1
+                self_val = torch.sum(r ** 2)
+                r = torch.matmul(r, r.T)
+                count += torch.sum(index[kk]).item() ** 2 / 2
+                alpha += (torch.sum(r) - self_val).items() / 2  # 残差的累积交错乘积
+            self.alphas[k]['value'] = alpha / count  # 更新alpha
 
+        # 更新相关系数矩阵
+        for k, v in self.alphas.items():
+            index = v['index']
+            value = v['value']
+            for kk in range(len(self.clusters)):
+                for i in index[kk]:
+                    self.clusters[kk]['alpha'][i, index] = value
