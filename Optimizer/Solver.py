@@ -21,54 +21,53 @@ alpha_i: {'index': [index_1, index_2, ... , index_K], 'value': value}
 
 import torch
 
+import sys
+sys.path.append('C:/Users/Administrator/Desktop/Repositories/GEE')
 
-link_func_dic = {}  # 连接函数字典，可以直接调用
-var_func_dic = {}  # 方差函数字典，直接调用
+from Optimizer.func_dic import link_func_dic, var_func_dic  # 连接函数字典
+from Optimizer.Model import GEEModel
 
 
 class LossMaker:
-    def __init__(self, mean_link: str = 'probit', variance_func: str = 'binary',
-                 clusters=None, model=None):
+    def __init__(self, link_func: str = 'probit', var_func: str = 'binary'):
         """
-        :param mean_link: 均值链接函数
-        :param variance_func: 方差和均值的函数
-        :param clusters: 初始化的cluster
-        :param model: 模型，对应的是mu = g^{-1}(X^\top\beta)
+        :param link_func: 均值链接函数
+        :param var_func: 方差和均值的函数
         """
-        self.mean_link = link_func_dic[mean_link]
-        self.variance_func = var_func_dic[variance_func]
-        self.clusters = clusters
-        self.model = model
+        self.mean_link = link_func_dic[link_func]
+        self.var_func = var_func_dic[var_func]
 
-    def cal_mat(self, phi: float):  # 返回GEE1.0中所需的矩阵
+    def cal_mat(self, phi: float, clusters, model):  # 返回GEE1.0中所需的矩阵
         """
         :param phi: 当前的phi系数
+        :param clusters:
+        :param model:
         :return:
         """
         d_top = []
         v_inv = []
         # 计算D_k和V_k的逆
-        for k in range(len(self.clusters)):  # 对K个cluster循环
+        for k in range(len(clusters)):  # 对K个cluster循环
             d_k = []
-            x = self.clusters[k]['x']  # 一个N_k * input_dim的矩阵
+            x = clusters[k]['x']  # 一个N_k * input_dim的矩阵
             for j in range(len(x)):  # 对每个样本计算梯度
-                self.model.zero_grad()
-                y = self.model()
+                model.zero_grad()
+                y = model()
                 y.backward()
-                d_k.append(torch.clone(self.model.Dense.weight.grad))
+                d_k.append(torch.clone(model.Dense.weight.grad))
             d_k = torch.cat(d_k, dim=0)  # 维度是N_k * input_dim
             d_top.append(d_k.T)
 
-            s_k_inv = torch.eye(len(x)) * 1 / torch.sqrt(self.variance_func(self.model(x)) * phi)
-            alpha = self.clusters[k]['alpha']  # 相关性矩阵
+            s_k_inv = torch.eye(len(x)) * 1 / torch.sqrt(self.var_func(model(x)) * phi)
+            alpha = clusters[k]['alpha']  # 相关性矩阵
             alpha_inv = torch.inverse(alpha)  # 相关系数矩阵的逆
             v_k = torch.matmul(torch.matmul(s_k_inv, alpha_inv), s_k_inv)
             v_inv.append(v_k)
 
         return d_top, v_inv
 
-    def make_loss(self, phi):  # 获得损失函数
-        d_top, v_inv = self.cal_mat(phi)
+    def make_loss(self, phi, clusters, model):  # 获得损失函数
+        d_top, v_inv = self.cal_mat(phi, clusters, model)
         return Loss(d_top, v_inv)
 
 
@@ -99,21 +98,32 @@ class ModelLogit(torch.nn.Module):  # 使用Logit作为激活函数的模型
         return x
 
 
-class Solver:
-    def __init__(self, model, clusters, alphas: dict, loss_maker: LossMaker):
+class GEE:  # 初始化需要传入
+    def __init__(self, alphas: dict, clusters: list, link_func: str = 'sigmoid', var_func: str = 'probit',
+                 device: str = 'cuda'):
         """
-        :param model: 模型
-        :param clusters: 族
-        :param alphas: alpha的位置和值的字典
-        :param loss_maker: 损失函数构造类
+        :param alphas: alpha字典
+        :param clusters: cluster列表
+        :param link_func: 均值的连接函数
+        :param device:
         """
-        self.model = model
-        self.clusters = clusters
         self.alphas = alphas
-        self.loss_maker = loss_maker
+        self.clusters = clusters
+        self.model = GEEModel(input_dim=clusters[0]['x'].shape[1], link_func=link_func)  # 生成一个模型
+        if device == 'cuda':
+            self.model.cuda()
+
+        self.loss_maker = LossMaker(link_func=link_func, var_func=var_func)
         self.phi = 1  # 初始化phi
-        self.loss = loss_maker.make_loss(self.phi)  # 初始化损失函数
-        self.optimizer = torch.optim.AdamW(self.model, lr=1e-3)
+        self.loss = self.loss_maker.make_loss(self.phi, clusters=clusters, model=self.model)  # 初始化损失函数
+        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=1e-3)
+
+    def fit(self, epochs: int = 10, n_iter: int = 100):
+        """
+        :param epochs: 交替优化的轮数
+        :param n_iter: 迭代次数
+        """
+        self.solve(epochs=epochs, n_iter=n_iter)
 
     def solve(self, epochs: int = 10, n_iter: int = 100):
         """
@@ -123,7 +133,7 @@ class Solver:
         for n in range(epochs):
             self.optimize(n_iter)
             self.renew_param()  # 更新alpha和phi
-            self.loss = self.loss_maker.make_loss(self.phi)  # 更新loss
+            self.loss = self.loss_maker.make_loss(self.phi, clusters=self.clusters, model=self.model)  # 更新loss
 
     def optimize(self, n_iter: int = 100):  # 固定loss优化beta
         for i in range(n_iter):
@@ -147,7 +157,7 @@ class Solver:
 
         for k in range(len(self.clusters)):
             mu = self.model(self.clusters[k]['x'])
-            v = self.loss_maker.variance_func(mu)
+            v = self.loss_maker.var_func(mu)
             r = self.clusters[k]['y'] - mu
             res.append(r)
             var.append(v)
@@ -176,3 +186,4 @@ class Solver:
             for kk in range(len(self.clusters)):
                 for i in index[kk]:
                     self.clusters[kk]['alpha'][i, index] = value
+                    self.clusters[kk]['alpha'][i, i] = 1  # 对角元是1
