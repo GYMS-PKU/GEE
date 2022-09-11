@@ -18,10 +18,10 @@ alpha_i: {'index': [index_1, index_2, ... , index_K], 'value': value}
 - init
 """
 
-
 import torch
 
 import sys
+
 sys.path.append('C:/Users/Administrator/Desktop/Repositories/GEE')
 
 from Optimizer.func_dic import link_func_dic, var_func_dic  # 连接函数字典
@@ -52,16 +52,18 @@ class LossMaker:
             x = clusters[k]['x']  # 一个N_k * input_dim的矩阵
             for j in range(len(x)):  # 对每个样本计算梯度
                 model.zero_grad()
-                y = model()
+                y = model(x[j])
                 y.backward()
                 d_k.append(torch.clone(model.Dense.weight.grad))
             d_k = torch.cat(d_k, dim=0)  # 维度是N_k * input_dim
+            d_k = d_k.detach()  # 去掉梯度
             d_top.append(d_k.T)
 
-            s_k_inv = torch.eye(len(x)) * 1 / torch.sqrt(self.var_func(model(x)) * phi)
+            s_k_inv = torch.eye(len(x)).cuda() * 1 / torch.sqrt(self.var_func(model(x)) * phi)
             alpha = clusters[k]['alpha']  # 相关性矩阵
             alpha_inv = torch.inverse(alpha)  # 相关系数矩阵的逆
             v_k = torch.matmul(torch.matmul(s_k_inv, alpha_inv), s_k_inv)
+            v_k = v_k.detach()  # 去掉梯度
             v_inv.append(v_k)
 
         return d_top, v_inv
@@ -73,7 +75,7 @@ class LossMaker:
 
 class Loss(torch.nn.Module):  # 求解估计方程的损失函数
     def __init__(self, d_top, v_inv):
-        super().__init__()
+        super(Loss, self).__init__()
         self.d_top = d_top
         self.v_inv = v_inv
 
@@ -147,6 +149,8 @@ class GEE:  # 初始化需要传入
             loss.backward()
             self.optimizer.step()
 
+        print(loss.item())
+
     def renew_param(self):  # 更新alpha和phi
         # 更新phi
         phi = 0
@@ -176,7 +180,7 @@ class GEE:  # 初始化需要传入
                 self_val = torch.sum(r ** 2)
                 r = torch.matmul(r, r.T)
                 count += torch.sum(index[kk]).item() ** 2 / 2
-                alpha += (torch.sum(r) - self_val).items() / 2  # 残差的累积交错乘积
+                alpha += (torch.sum(r) - self_val).item() / 2  # 残差的累积交错乘积
             self.alphas[k]['value'] = alpha / count  # 更新alpha
 
         # 更新相关系数矩阵
@@ -184,6 +188,7 @@ class GEE:  # 初始化需要传入
             index = v['index']
             value = v['value']
             for kk in range(len(self.clusters)):
-                for i in index[kk]:
-                    self.clusters[kk]['alpha'][i, index] = value
-                    self.clusters[kk]['alpha'][i, i] = 1  # 对角元是1
+                for i in range(len(index[kk])):
+                    if index[kk][i]:
+                        self.clusters[kk]['alpha'][i, index[kk]] = value
+                        self.clusters[kk]['alpha'][i, i] = 1  # 对角元是1

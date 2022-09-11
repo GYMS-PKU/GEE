@@ -16,6 +16,7 @@ class GEEModel(torch.nn.Module):
             self.act = torch.nn.Sigmoid()
         else:
             raise NotImplementedError
+        self.input_dim = input_dim
 
     def forward(self, x):
         return self.act(self.Dense(x))
