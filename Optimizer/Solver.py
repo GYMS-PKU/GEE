@@ -12,8 +12,11 @@ mark：
 第二个地方是更新alpha时，需要获得所有共用alpha的位置
 
 针对这个情况，初始化模型的时候需要传入alpha的位置和值字典，形式是：
-alpha_i: {'index': [index_1, index_2, ... , index_K], 'value': value}
+alpha_i: {'index': [mat_1, ..., mat_k], 'value': value}
+其中mat_i是0-1矩阵，第i行j列为1表示i和j使用该相关系数，同时满足是对称的，因为要更新alpha矩阵
 
+2022-09-21
+- 修正bug：多alpha时，并不能划分成等价类，因此alpha的index必须指定使用这个alpha的所有共同对
 2022-09-03
 - init
 """
@@ -156,8 +159,8 @@ class GEE:  # 初始化需要传入
         phi = 0
         N = 0
 
-        res = []  # 保存预测均值
-        var = []  # 保存方差
+        res = []  # 保存预测均值，长度是cluster的个数
+        var = []  # 保存方差，长度是cluster的个数
 
         for k in range(len(self.clusters)):
             mu = self.model(self.clusters[k]['x'])
@@ -176,19 +179,15 @@ class GEE:  # 初始化需要传入
             count = 0
             alpha = 0
             for kk in range(len(res)):
-                r = res[kk][index[kk]] / torch.sqrt(self.phi * var[kk][index[kk]])  # 标准化残差，形状是n_k * 1
-                self_val = torch.sum(r ** 2)
-                r = torch.matmul(r, r.T)
-                count += torch.sum(index[kk]).item() ** 2 / 2
-                alpha += (torch.sum(r) - self_val).item() / 2  # 残差的累积交错乘积
-            self.alphas[k]['value'] = alpha / count  # 更新alpha
+                r = res[kk] / torch.sqrt(self.phi * var[kk])  # 标准化残差，形状是n_k * 1
+                r = torch.matmul(r, r.T)  # 生成所有的交错乘积
+                count += torch.sum(index[kk]).item() / 2  # 这就是交错乘积的个数
+                alpha += torch.sum(r * index[kk]).item() / 2  # 残差的累积交错乘积
+            self.alphas[k]['value'] = alpha / (count - self.model.input_dim)  # 更新alpha
 
         # 更新相关系数矩阵
         for k, v in self.alphas.items():
             index = v['index']
             value = v['value']
             for kk in range(len(self.clusters)):
-                for i in range(len(index[kk])):
-                    if index[kk][i]:
-                        self.clusters[kk]['alpha'][i, index[kk]] = value
-                        self.clusters[kk]['alpha'][i, i] = 1  # 对角元是1
+                self.clusters[kk]['alpha'][index[kk]] = value  # 更新值
